@@ -1,0 +1,160 @@
+name: build
+
+on:
+  push:
+    tags:
+      - "*"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    container: alpine:3.24
+
+    steps:
+      - name: Prepare Alpine
+        run: |
+          apk add --no-cache \
+            bash \
+            binutils \
+            ca-certificates \
+            clang \
+            curl \
+            file \
+            gcompat \
+            git \
+            github-cli \
+            libstdc++ \
+            lld \
+            unzip
+
+      - name: Install Bun, node shim, and pickarc
+        run: |
+          curl -fsSL https://bun.sh/install | bash
+          export PATH="$HOME/.bun/bin:$PATH"
+          ln -sf "$HOME/.bun/bin/bun" /usr/local/bin/node
+          echo "$HOME/.bun/bin" >> "$GITHUB_PATH"
+
+          bun add -g github:FuPeiJiang/pickarc.js
+          pickarc --version
+
+          printf '%s\n' 'console.log("node shim uses bun " + process.versions.bun)' > /tmp/node-shim.js
+          node /tmp/node-shim.js
+
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Trust workspace
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Download minimal NDK r30 beta sysroot
+        env:
+          ANDROID_SDK_ROOT: ${{ runner.temp }}/android-sdk
+        run: |
+          mkdir -p "$ANDROID_SDK_ROOT"
+          cd "$ANDROID_SDK_ROOT"
+
+          pickarc cp \
+            --include-glob 'android-ndk-r30-beta1/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/**' \
+            --or-glob 'android-ndk-r30-beta1/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/*/include/**' \
+            --strip-components 1 \
+            'https://dl.google.com/android/repository/android-ndk-r30-beta1-linux.zip'
+
+          for libdir in x86_64-linux-android aarch64-linux-android; do
+            for api in 24 36; do
+              pickarc cp \
+                --include-glob "android-ndk-r30-beta1/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/${libdir}/${api}/crtbegin_dynamic.o" \
+                --or-glob "android-ndk-r30-beta1/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/${libdir}/${api}/crtend_android.o" \
+                --or-glob "android-ndk-r30-beta1/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/${libdir}/${api}/libc.so" \
+                --strip-components 1 \
+                'https://dl.google.com/android/repository/android-ndk-r30-beta1-linux.zip'
+            done
+          done
+
+      - name: Build
+        env:
+          ANDROID_SDK_ROOT: ${{ runner.temp }}/android-sdk
+        run: |
+          NDK_LLVM="$ANDROID_SDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64"
+          SYSROOT="$NDK_LLVM/sysroot"
+          RES="$(find "$NDK_LLVM/lib/clang" -mindepth 1 -maxdepth 1 -type d | sort | tail -n 1)"
+
+          mkdir -p dist
+
+          for arch in x86_64 aarch64; do
+            case "$arch" in
+              x86_64)
+                triple=x86_64-linux-android
+                libdir=x86_64-linux-android
+                ;;
+              aarch64)
+                triple=aarch64-linux-android
+                libdir=aarch64-linux-android
+                ;;
+            esac
+
+            for api in 24 36; do
+              out="dist/adb-termux-enter.${arch}.android${api}"
+
+              clang --no-default-config \
+                --target="${triple}${api}" \
+                --sysroot="$SYSROOT" \
+                -resource-dir "$RES" \
+                -nostdlib \
+                -fuse-ld=lld \
+                -Wl,-pie \
+                -Wl,--dynamic-linker=/system/bin/linker64 \
+                "$SYSROOT/usr/lib/${libdir}/${api}/crtbegin_dynamic.o" \
+                adb-termux-enter.c \
+                "$SYSROOT/usr/lib/${libdir}/${api}/libc.so" \
+                "$SYSROOT/usr/lib/${libdir}/${api}/crtend_android.o" \
+                -o "$out"
+
+              file "$out"
+              readelf -d "$out" | grep 'Shared library: \[libc.so\]'
+              readelf -l "$out" | grep 'Requesting program interpreter: /system/bin/linker64'
+            done
+          done
+
+          cd dist
+          sha256sum adb-termux-enter.* > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Upload temporary artifacts
+        if: "!startsWith(github.ref, 'refs/tags/')"
+        uses: actions/upload-artifact@v4
+        with:
+          name: adb-termux-enter
+          path: |
+            dist/adb-termux-enter.*
+            dist/SHA256SUMS
+          if-no-files-found: error
+
+      - name: Publish GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          {
+            printf '## SHA256\n\n'
+            printf '```text\n'
+            cat dist/SHA256SUMS
+            printf '```\n'
+          } > release-notes.md
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/adb-termux-enter.* dist/SHA256SUMS --clobber
+            gh release edit "$TAG" --title "$TAG" --notes-file release-notes.md
+          else
+            gh release create "$TAG" \
+              dist/adb-termux-enter.* \
+              dist/SHA256SUMS \
+              --title "$TAG" \
+              --notes-file release-notes.md \
+              --verify-tag
+          fi

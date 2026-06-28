@@ -1,0 +1,5 @@
+adb-termux-enter
+adb-termux-enter.*.android*
+dist/
+*.o
+*.d
